@@ -24,7 +24,7 @@ const root = cli({
     // this will be the name of the generated library without the extension
     const genLib = protoName.substring(0, protoName.length - ext.length);
     // process the protobuf definition if it parses then we create artifacts
-    const services = await parseProto(protoPath);
+    const parse = await parseProto(protoPath);
     if (await exists(outDir)) {
       if (!clobber) {
         throw new Error(`${outDir} exists --force to overwrite`);
@@ -36,19 +36,20 @@ const root = cli({
     await copy(protoPath, join(outDir, basename(protoPath)));
     // the file could contain multiple services each with multiple handlers
     // we create a NATS service per service
-    for (const s of services) {
+    for (const s of parse.services) {
       const handlersPath = join(outDir, `${s.name}_handlers.ts`);
       if (await exists(handlersPath) && clobber) {
         const bak = join(outDir, `${s.name.toLowerCase()}_handlers.bak`);
         await copy(handlersPath, bak);
         console.log(
-            `${handlersPath} was backed up to ${bak} - subsequent runs will destroy the backup!`,
+          `${handlersPath} was backed up to ${bak} - subsequent runs will destroy the backup!`,
         );
       }
-      await generateHandlers(outDir, s, genLib);
-      await generateMain(outDir, s, genLib);
-      await generateClient(outDir, s, genLib);
+      await generateStubs(outDir, s, genLib);
     }
+    await generateMain(outDir, parse, genLib);
+    await generateClient(outDir, parse, genLib);
+
     // for now this is a nodejs only, so we need a package.json and tsconfig
     await generateNodePackage(join(outDir, "package.json"), protoPath);
     await generateTscConfig(join(outDir, "tsconfig.json"));
@@ -82,12 +83,17 @@ root.addFlag({
   value: false,
 });
 
-type ServiceParse = {
-  name: string;
-  rpcs: ServiceRpc[];
+type ProtoParse = {
+  packageName: string;
+  services: ProtoService[];
 };
 
-type ServiceRpc = {
+type ProtoService = {
+  name: string;
+  rpcs: ProtoRpc[];
+};
+
+type ProtoRpc = {
   name: string;
   inType: string;
   outType: string;
@@ -118,53 +124,58 @@ async function copy(pathA: string, pathB: string) {
   await save(pathB, d);
 }
 
-function generateImports(
-  services: ServiceRpc[],
+function generateImport(types: string[], protoLibName: string): string {
+  types = types.filter((e, idx) => {
+    return types.indexOf(e) === idx;
+  });
+  return `import { ${types.sort().join(", ")} } from "./${protoLibName}.js";`;
+}
+
+function generateServiceImports(
+  srv: ProtoService,
   protoLibName: string,
 ): string {
   const a: string[] = [];
-  services.forEach((s) => {
-    a.push(s.outType, s.inType);
+  srv.rpcs.forEach((r) => {
+    a.push(r.outType, r.inType);
   });
-  const types = a.filter((e, idx) => {
-    return a.indexOf(e) === idx;
-  });
-  const protoImports = `import {${
-    types.sort().join(", ")
-  }} from "./${protoLibName}.js";`;
-
-  return [protoImports].join("\n");
+  return generateImport(a, protoLibName);
 }
 
-function generateHandler(h: ServiceRpc): string {
-  return `export function ${h.name}Handler(r: ${h.inType}): Promise<${h.outType}>{
-  // add your code here
-  return Promise.reject(new Error("not implemented"));
-}\n`;
+function generateAllProtoImports(
+  parse: ProtoParse,
+  protoLibName: string,
+): string {
+  const a: string[] = [];
+  parse.services.forEach((s) => {
+    s.rpcs.forEach((r) => {
+      a.push(r.outType, r.inType);
+    });
+  });
+  return generateImport(a, protoLibName);
+}
+
+function generateHandler(h: ProtoRpc): string {
+  return `
+    export function ${h.name}Handler(r: ${h.inType}): Promise<${h.outType}>{
+        // add your code here
+        return Promise.reject(new Error("not implemented"));
+    }
+`;
 }
 
 function generateHandlerImport(
-  name: string,
-  parse: ServiceRpc[],
+  fn: string,
+  parse: ProtoService,
 ): string {
-  const handlers = parse.map((p) => {
-    return `${p.name}Handler`;
-  });
-  return `import {${
-    handlers.join(", ")
-  }} from "./${name.toLowerCase()}_handlers.js";`;
+  return `import { ${parse.name} } from "./${fn.toLowerCase()}_handlers.js";`;
 }
 
-function createService(service: ServiceParse): string {
-  return `  
-const nc = await connect();
+function createService(srv: ProtoParse): string {
+  return `const nc = await connect();
 const srv = await nc.services.add({
-  name: "${service.name}",
+  name: "${srv.packageName}",
   version: "0.0.1",
-  endpoint: {
-    subject: "${service.name}",
-    handler: null
-  }
 });
 
 srv.stopped.then((err) => {
@@ -173,16 +184,15 @@ srv.stopped.then((err) => {
 `;
 }
 
-function addEndpoint(h: ServiceRpc): string {
-  return `
-srv.addEndpoint("${h.name}", (err, m) => {
+function addEndpoint(srv: ProtoService, h: ProtoRpc): string {
+  return `${srv.name.toLowerCase()}.addEndpoint("${h.name}", (err, m) => {
   // if we get an error from the subscription, stop
   if(err) {
     srv.stop(err);
     return;
   }
   const input = ${h.inType}.decode(m?.data);
-  ${h.name}Handler(input)
+  ${srv.name}.${h.name}Handler(input)
     .then((o) => { 
       m.respond(${h.outType}.encode(o).finish())
     })
@@ -193,16 +203,18 @@ srv.addEndpoint("${h.name}", (err, m) => {
 `;
 }
 
-async function generateHandlers(
+async function generateStubs(
   fn: string,
-  service: ServiceParse,
+  service: ProtoService,
   genLibPath: string,
 ) {
   const sections: string[] = ["// edit your services here"];
-  sections.push(generateImports(service.rpcs, genLibPath));
+  sections.push(generateServiceImports(service, genLibPath));
+  sections.push(`export namespace ${service.name} {`);
   service.rpcs.forEach((h) => {
     sections.push(generateHandler(h));
   });
+  sections.push(`}`);
   await save(
     join(fn, `${service.name.toLowerCase()}_handlers.ts`),
     sections.join("\n"),
@@ -211,28 +223,40 @@ async function generateHandlers(
 
 async function generateMain(
   dir: string,
-  srv: ServiceParse,
+  parse: ProtoParse,
   genLibPath: string,
 ) {
   const sections: string[] = [`
 // This file implements the NATS service portion of your service.
 // The handlers for the various operations are defined in
-// ${srv.name.toLowerCase()}_handlers.ts file.
+// <service>_handlers.ts file.
 // To build the service run: 'npm run generate'
-// To start the service do: 'node ${srv.name.toLowerCase()}_service.js' 
+// To start the service do: 'node ${parse.packageName.toLowerCase()}_service.js' 
 // 
 // THE CONTENTS OF FILE IS GENERATED AND SHOULDN'T BE EDITED
 // THIS TECHNOLOGY IS EXPERIMENTAL USE AT YOUR OWN RISK
 `];
-  sections.push(generateHandlerImport(srv.name, srv.rpcs));
-  sections.push(generateImports(srv.rpcs, genLibPath));
   sections.push(`import { connect, ServiceError } from "nats";`);
-  sections.push(createService(srv));
-  srv.rpcs.forEach((fn) => {
-    sections.push(addEndpoint(fn));
+
+  sections.push(generateAllProtoImports(parse, genLibPath));
+
+  parse.services.forEach((srv) => {
+    sections.push(generateHandlerImport(srv.name, srv));
   });
+
+  sections.push(createService(parse));
+
+  parse.services.forEach((srv) => {
+    sections.push(
+      `const ${srv.name.toLowerCase()} = srv.addGroup("${srv.name}");`,
+    );
+    srv.rpcs.forEach((rpc) => {
+      sections.push(addEndpoint(srv, rpc));
+    });
+  });
+
   await save(
-    join(dir, `${srv.name.toLowerCase()}_service.ts`),
+    join(dir, `${parse.packageName.toLowerCase()}_service.ts`),
     sections.join("\n"),
   );
 }
@@ -278,41 +302,58 @@ async function generateTscConfig(filePath: string) {
   await saveJSON(filePath, config);
 }
 
-async function generateClient(outDir: string, srv: ServiceParse, protoLibName: string): Promise<void> {
+async function generateClient(
+  outDir: string,
+  parse: ProtoParse,
+  protoLibName: string,
+): Promise<void> {
   const parts: string[] = [];
   parts.push(`// THE CONTENTS OF FILE IS GENERATED AND SHOULDN'T BE EDITED
 // THIS TECHNOLOGY IS EXPERIMENTAL USE AT YOUR OWN RISK
 `);
-  parts.push(generateImports(srv.rpcs, protoLibName));
+  parts.push(generateAllProtoImports(parse, protoLibName));
   parts.push(`import { NatsConnection, ServiceError } from "nats"`);
-  parts.push(`
+
+  parse.services.forEach((srv) => {
+    parts.push(`
 export class ${srv.name}Client {
   nc: NatsConnection;
   constructor(nc: NatsConnection) {
     this.nc = nc;
   }  
 `);
-
-  srv.rpcs.forEach((rpc) => {
-    parts.push(`  async ${rpc.name}(data: ${rpc.inType}): Promise<${rpc.outType}> {
+    srv.rpcs.forEach((rpc) => {
+      parts.push(
+        `  async ${rpc.name}(data: ${rpc.inType}): Promise<${rpc.outType}> {
     const r = await this.nc.request("${srv.name}.${rpc.name}", ${rpc.inType}.encode(data).finish());
     return ${rpc.outType}.decode(r.data);
   }  
-`);
+`,
+      );
+    });
+    parts.push(`}`);
   });
- parts.push(`}`)
 
-  await save(join(outDir, `${srv.name.toLowerCase()}_client.ts`), parts.join("\n"));
+  await save(
+    join(outDir, `${parse.packageName.toLowerCase()}_clients.ts`),
+    parts.join("\n"),
+  );
 }
 
-async function parseProto(filePath: string): Promise<ServiceParse[]> {
+async function parseProto(filePath: string): Promise<ProtoParse> {
   const proto = await Deno.readTextFile(filePath);
+  const r = { packageName: "", services: [] } as ProtoParse;
+
+  // package regex
+  const packageRE = /package\s+(\w+)([\s\S]*?)/;
+  let m = packageRE.exec(proto);
+  if (m) {
+    r.packageName = m[1];
+  }
 
   // service definitions regex
   const servicesRE = /service\s+(\w+)([\s\S]*?)}\n}/mg;
 
-  const services = [];
-  let m;
   // look for one or more 'service'
   while ((m = servicesRE.exec(proto)) !== null) {
     const name = m?.[1];
@@ -330,12 +371,14 @@ async function parseProto(filePath: string): Promise<ServiceParse[]> {
         name: m?.[1],
         inType: m?.[2],
         outType: m?.[3],
-      } as ServiceRpc;
+      } as ProtoRpc;
     });
-
-    services.push({ name, rpcs });
+    if (r.packageName === "") {
+      r.packageName = r.services?.[0].name;
+    }
+    r.services.push({ name, rpcs });
   }
-  return services;
+  return r;
 }
 
 Deno.exit(await root.execute(Deno.args));
