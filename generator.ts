@@ -30,7 +30,11 @@ const root = cli({
         throw new Error(`${outDir} exists --force to overwrite`);
       }
     } else {
-      await Deno.mkdir(outDir);
+      await Deno.mkdir(outDir)
+        .catch((err) => {
+          console.error(`failed to create ${outDir}: ${err.message}`);
+          throw err;
+        });
     }
     // copy the protobuf file
     await copy(protoPath, join(outDir, basename(protoPath)));
@@ -54,7 +58,7 @@ const root = cli({
     await generateNodePackage(join(outDir, "package.json"), protoPath);
     await generateTscConfig(join(outDir, "tsconfig.json"));
 
-    console.log(`edit handlers path and run 'npm run build' to build`);
+    console.log(`'npm install', edit handlers path, 'npm run build'`);
     return Promise.resolve(0);
   },
 });
@@ -193,11 +197,11 @@ function addEndpoint(srv: ProtoService, h: ProtoRpc): string {
   }
   const input = ${h.inType}.decode(m?.data);
   ${srv.name}.${h.name}Handler(input)
-    .then((o) => { 
+    .then((o) => {
       m.respond(${h.outType}.encode(o).finish())
     })
-    .catch((err) => { 
-      m.respondError(500, err.message); 
+    .catch((err) => {
+      m.respondError(500, err.message);
     });
 });
 `;
@@ -231,8 +235,8 @@ async function generateMain(
 // The handlers for the various operations are defined in
 // <service>_handlers.ts file.
 // To build the service run: 'npm run generate'
-// To start the service do: 'node ${parse.packageName.toLowerCase()}_service.js' 
-// 
+// To start the service do: 'node ${parse.packageName.toLowerCase()}_service.js'
+//
 // THE CONTENTS OF FILE IS GENERATED AND SHOULDN'T BE EDITED
 // THIS TECHNOLOGY IS EXPERIMENTAL USE AT YOUR OWN RISK
 `];
@@ -278,6 +282,7 @@ async function generateNodePackage(filePath: string, protoPath: string) {
     dependencies: {
       "ts-proto": "^1.137.0",
       typescript: "^4.9.4",
+      "nats": "^2.13.1",
     },
     keywords: [],
     author: "",
@@ -320,14 +325,14 @@ export class ${srv.name}Client {
   nc: NatsConnection;
   constructor(nc: NatsConnection) {
     this.nc = nc;
-  }  
+  }
 `);
     srv.rpcs.forEach((rpc) => {
       parts.push(
         `  async ${rpc.name}(data: ${rpc.inType}): Promise<${rpc.outType}> {
     const r = await this.nc.request("${srv.name}.${rpc.name}", ${rpc.inType}.encode(data).finish());
     return ${rpc.outType}.decode(r.data);
-  }  
+  }
 `,
       );
     });
